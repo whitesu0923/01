@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🧲 AI 智能冰箱贴制造机</title>
+  
+  <!-- 引入 Transformers.js 用于前端 AI 抠图 -->
+  <script type="module">
+    import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.1';
+    
+    // 强制使用 WebAssembly 后端，确保几乎所有浏览器都能兼容运行，不依赖 WebGPU
+    env.backends.onnx.wasm.numThreads = 1;
+    // 设置模型缓存路径，避免重复下载
+    env.allowLocalModels = false;
+    
+    // 挂载到全局方便调用
+    window.pipeline = pipeline;
+  </script>
+
+  <style>
+    /* -------------------
+       基础重置与全局设定 
+       ------------------- */
+    body, html { 
+      margin: 0; padding: 0; 
+      width: 100%; height: 100%; 
+      overflow: hidden; 
+      font-family: 'PingFang SC', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+      /* 防止在手机上长按触发原生菜单，破坏沉浸感 */
+      -webkit-touch-callout: none;
+    }
+    
+    /* -------------------
+       灵魂背景：金属拉丝冰箱门 
+       ------------------- */
+    #fridge-door {
+      width: 100vw;
+      height: 100vh;
+      /* 使用重复的线性渐变模拟金属拉丝质感 */
+      background: repeating-linear-gradient(90deg, #daddf0 0%, #e8ebf8 2%, #daddf0 4%);
+      box-shadow: inset 0 0 150px rgba(0, 0, 0, 0.15);
+      position: relative;
+    }
+
+    /* -------------------
+       UI 区域：上传卡片 
+       ------------------- */
+    #upload-zone {
+      position: absolute;
+      top: 50%; left: 50%; transform: translate(-50%, -50%);
+      background: rgba(255, 255, 255, 0.65);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      padding: 40px;
+      border-radius: 28px;
+      border: 3px dashed #a0a5c0;
+      text-align: center;
+      transition: all 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+      z-index: 10;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+      width: 80%;
+      max-width: 320px;
+    }
+    
+    /* 上传完第一张图片后，UI 自动缩小并退让到角落 */
+    #upload-zone.minimized {
+      top: 24px; left: 24px; 
+      transform: scale(0.65) translate(0, 0);
+      transform-origin: top left; 
+      opacity: 0.7;
+      padding: 24px;
+    }
+    #upload-zone.minimized:hover {
+      opacity: 1;
+      transform: scale(0.7) translate(0, 0);
+    }
+
+    #upload-zone h2 { margin: 0 0 12px 0; color: #2c3e50; font-size: 24px; }
+    #upload-zone p { color: #5c6c7c; font-size: 14px; margin-bottom: 24px; line-height: 1.5; }
+    
+    /* 美化的上传按钮 */
+    #file-input { display: none; }
+    .upload-btn {
+      background: #2c3e50; color: white; 
+      padding: 14px 28px; border-radius: 50px;
+      font-weight: 600; font-size: 16px;
+      cursor: pointer; display: inline-block;
+      box-shadow: 0 6px 12px rgba(44, 62, 80, 0.3); 
+      transition: all 0.2s ease;
+    }
+    .upload-btn:hover { 
+      transform: translateY(-2px);
+      box-shadow: 0 8px 16px rgba(44, 62, 80, 0.4); 
+    }
+    .upload-btn:active {
+      transform: translateY(1px);
+    }
+
+    /* -------------------
+       加载状态指示器 (全屏遮罩)
+       ------------------- */
+    #loading-overlay {
+      display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(8px);
+      z-index: 1000; flex-direction: column; justify-content: center; align-items: center;
+    }
+    
+    /* 进度条容器 */
+    .progress-container {
+      width: 250px; height: 8px;
+      background: #e0e5ec; border-radius: 10px;
+      margin: 20px 0; overflow: hidden;
+      display: none; /* 默认隐藏，下载模型时显示 */
+    }
+    .progress-bar {
+      height: 100%; width: 0%;
+      background: linear-gradient(90deg, #3498db, #2ecc71);
+      border-radius: 10px; transition: width 0.3s ease;
+    }
+    
+    /* 呼吸动画的 LOGO / 提示 */
+    .pulse-ring {
+      width: 60px; height: 60px;
+      border: 4px solid #3498db; border-radius: 50%;
+      border-top-color: transparent;
+      animation: spin 1s linear infinite;
+      margin-bottom: 20px;
+    }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    
+    #loading-text { font-size: 20px; font-weight: 700; color: #2c3e50; }
+    #loading-subtext { font-size: 14px; color: #7f8c8d; margin-top: 12px; text-align: center; padding: 0 20px;}
+
+    /* -------------------
+       🧲 冰箱贴本体样式 
+       ------------------- */
+    .magnet {
+      position: absolute;
+      max-width: 220px;
+      max-height: 220px;
+      cursor: grab;
+      /* 核心物理效果：
+         1. 极高强度的白色 drop-shadow 暴力堆叠，生成无锯齿的实体白边
+         2. 最外层加上深色投影，产生厚度和立体感 */
+      filter: 
+        drop-shadow(0px -2px 1px #fff) drop-shadow(0px 2px 1px #fff) 
+        drop-shadow(2px 0px 1px #fff) drop-shadow(-2px 0px 1px #fff) 
+        drop-shadow(1px -1px 1px #fff) drop-shadow(-1px 1px 1px #fff) 
+        drop-shadow(1px 1px 1px #fff) drop-shadow(-1px -1px 1px #fff)
+        drop-shadow(0px 0px 2px #fff) drop-shadow(0px 0px 2px #fff)
+        drop-shadow(3px 8px 8px rgba(0,0,0,0.4));
+      
+      transition: transform 0.15s cubic-bezier(0.34, 1.56, 0.64, 1), filter 0.15s ease;
+      user-select: none;
+      -webkit-user-drag: none; /* 防止浏览器默认的图片拖拽重影 */
+      z-index: 1;
+    }
+
+    /* 抓起时的物理反馈：放大、倾斜、阴影加深扩散（模拟拿离表面） */
+    .magnet.dragging {
+      cursor: grabbing;
+      z-index: 100 !important;
+      transform: scale(1.15) rotate(-4deg);
+      filter: 
+        drop-shadow(0px -2px 1px #fff) drop-shadow(0px 2px 1px #fff) 
+        drop-shadow(2px 0px 1px #fff) drop-shadow(-2px 0px 1px #fff) 
+        drop-shadow(1px -1px 1px #fff) drop-shadow(-1px 1px 1px #fff) 
+        drop-shadow(1px 1px 1px #fff) drop-shadow(-1px -1px 1px #fff)
+        drop-shadow(0px 0px 2px #fff) drop-shadow(0px 0px 2px #fff)
+        drop-shadow(12px 24px 20px rgba(0,0,0,0.3));
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 主舞台 -->
+  <div id="fridge-door">
+    <div id="upload-zone">
+      <h2>🧲 AI 冰箱贴制造机</h2>
+      <p>上传任意照片<br>AI 将全自动提取主体，<br>并制作成带白边的立体冰箱贴！</p>
+      <label for="file-input" class="upload-btn">➕ 选择图片</label>
+      <input type="file" id="file-input" accept="image/*">
+    </div>
+  </div>
+
+  <!-- 全局加载遮罩 -->
+  <div id="loading-overlay">
+    <div class="pulse-ring"></div>
+    <div id="loading-text">正在初始化 AI 模型...</div>
+    <div class="progress-container" id="progress-container">
+       <div class="progress-bar" id="progress-bar"></div>
+    </div>
+    <div id="loading-subtext">由于纯前端计算，首次加载模型（约40MB）需要一点时间，请耐心等待。</div>
+  </div>
+
+  <script type="module">
+    // DOM 元素引用
+    const fileInput = document.getElementById('file-input');
+    const fridgeDoor = document.getElementById('fridge-door');
+    const uploadZone = document.getElementById('upload-zone');
+    const loadingOverlay = document.getElementById('loading-overlay');
+    const loadingText = document.getElementById('loading-text');
+    const loadingSubtext = document.getElementById('loading-subtext');
+    const progressContainer = document.getElementById('progress-container');
+    const progressBar = document.getElementById('progress-bar');
+    
+    // 全局状态
+    let magnetZIndex = 2; // 控制 Z 轴层级，确保最新抓起的在最上面
+    let segmenter = null; // 存储 AI 模型实例
+    let isModelLoading = false;
+
+    // --- UI 辅助函数 ---
+    
+    function showLoading(title, subtitle = '', showProgress = false) {
+      loadingText.textContent = title;
+      loadingSubtext.textContent = subtitle;
+      progressContainer.style.display = showProgress ? 'block' : 'none';
+      loadingOverlay.style.display = 'flex';
+    }
+
+    function hideLoading() {
+      loadingOverlay.style.display = 'none';
+      progressBar.style.width = '0%';
+    }
+
+    function updateProgress(percent) {
+      progressBar.style.width = `${percent}%`;
+    }
+
+    // --- AI 核心功能 ---
+
+    /**
+     * 加载图像分割模型 (RMBG-1.4 专门用于精确去除背景)
+     * 该过程只在第一次上传图片时执行
+     */
+    async function initModel() {
+      // 检查 pipeline 是否成功挂载
+      if (!window.pipeline) {
+         alert("AI 引擎尚未准备好，请检查网络连接或稍后再试。");
+         return false;
+      }
+      
+      if (segmenter) return true;
+      if (isModelLoading) return false;
+      
+      isModelLoading = true;
+      showLoading("正在下载 AI 抠图模型", "首次加载约需下载 40MB 数据，将会缓存在您的浏览器中", true);
+      
+      try {
+        // 使用量化版本 (quantized: true) 减小模型体积，加快加载速度
+        segmenter = await window.pipeline('image-segmentation', 'briaai/RMBG-1.4', {
+          device: 'wasm',
+          quantized: true,
+          progress_callback: (info) => {
+            if (info.status === 'downloading' || info.status === 'progress') {
+               // Transformers.js progress callback
+               const progress = info.progress || 0;
+               updateProgress(progress);
+               if(info.file) {
+                 loadingSubtext.textContent = `正在下载文件: ${info.file} (${Math.round(progress)}%)`;
+               }
+            } else if (info.status === 'ready') {
+               updateProgress(100);
+               loadingSubtext.textContent = "模型下载完成，正在初始化...";
+            }
+          }
+        });
+        isModelLoading = false;
+        return true;
+      } catch (error) {
+        console.error("AI 模型加载失败:", error);
+        alert("AI 模型加载失败: " + error.message + "
+
+请检查网络连接，或尝试刷新页面。");
+        hideLoading();
+        isModelLoading = false;
+        return false;
+      }
+    }
+
+    /**
+     * 核心抠图函数
+     * 接收一个原始 Image 元素，返回一张去除了背景的透明 PNG 的 DataURL
+     */
+    async function processImageRemoval(imageElement) {
+      showLoading("AI 正在施展魔法...", "正在识别画面主体并剥离背景，请稍候");
+      
+      try {
+        // 1. 将原图绘制到 Canvas 以提取像素数据
+        const sourceCanvas = document.createElement('canvas');
+        sourceCanvas.width = imageElement.naturalWidth;
+        sourceCanvas.height = imageElement.naturalHeight;
+        const sourceCtx = sourceCanvas.getContext('2d');
+        sourceCtx.drawImage(imageElement, 0, 0);
+        
+        // 2. 将 Canvas 转换为 DataURL 输入给 AI 模型
+        const imageDataUrl = sourceCanvas.toDataURL('image/jpeg', 0.8);
+        
+        // 3. 执行 AI 推理
+        console.log("开始 AI 推理...");
+        const result = await segmenter(imageDataUrl);
+        console.log("AI 推理完成", result);
+        
+        let finalImageUrl = null;
+
+        // 4. 解析模型返回结果
+        // RMBG-1.4 在 Transformers.js 中通常返回一个 RawImage 对象，或者直接返回抠好的图片 base64
+        if (Array.isArray(result) && result.length > 0) {
+            // 有些版本返回数组
+            if (result[0].mask) {
+                finalImageUrl = await applyMaskToCanvas(sourceCanvas, result[0].mask);
+            } else if (result[0].src) {
+                finalImageUrl = result[0].src;
+            }
+        } else if (result.src) {
+            finalImageUrl = result.src;
+        } else if (result.toDataURL) {
+            // 如果返回的是自定义的 RawImage 类且带有 toDataURL 方法
+            finalImageUrl = result.toDataURL();
+        } else if (result instanceof Blob) {
+           finalImageUrl = URL.createObjectURL(result);
+        } else if (typeof result === 'string') {
+            finalImageUrl = result;
+        }
+        
+        // 如果上面都没拿到，作为兜底方案返回原图
+        if (!finalImageUrl) {
+            console.warn("未能解析 AI 返回格式，使用原图。返回对象为:", result);
+            finalImageUrl = imageDataUrl;
+        }
+
+        hideLoading();
+        return finalImageUrl;
+      } catch (error) {
+        console.error("抠图过程发生异常:", error);
+        alert("抠图失败，将直接使用原图。错误信息见控制台。");
+        hideLoading();
+        return imageElement.src; // 失败退回原图
+      }
+    }
+    
+    /**
+     * 辅助函数：如果模型只返回了黑白 Mask（遮罩），我们需要手动将其应用到原图上
+     */
+    function applyMaskToCanvas(sourceCanvas, maskData) {
+        return new Promise((resolve) => {
+            const maskImg = new Image();
+            maskImg.onload = () => {
+                const targetCanvas = document.createElement('canvas');
+                targetCanvas.width = sourceCanvas.width;
+                targetCanvas.height = sourceCanvas.height;
+                const ctx = targetCanvas.getContext('2d');
+                
+                // 先画原图
+                ctx.drawImage(sourceCanvas, 0, 0);
+                
+                // globalCompositeOperation = 'destination-in' 
+                // 意思是：只保留原图与 Mask 重叠（白色）的部分，Mask 黑色的部分变透明
+                ctx.globalCompositeOperation = 'destination-in';
+                ctx.drawImage(maskImg, 0, 0, targetCanvas.width, targetCanvas.height);
+                
+                resolve(targetCanvas.toDataURL('image/png'));
+            };
+            // 兼容 mask 是 URL 或者是 RawImage 对象的不同情况
+            maskImg.src = typeof maskData === 'string' ? maskData : maskData.src || maskData.toDataURL();
+        });
+    }
+
+    // --- 文件处理与交互逻辑 ---
+
+    /**
+     * 统一的文件处理入口
+     */
+    async function handleFile(file) {
+      if (!file || !file.type.startsWith('image/')) {
+        alert("请上传有效的图片文件！");
+        return;
+      }
+
+      // 1. 初始化模型（如果已初始化会瞬间通过）
+      const isReady = await initModel();
+      if (!isReady) return;
+      
+      // 缩小 UI，让出舞台
+      uploadZone.classList.add('minimized');
+      
+      const reader = new FileReader();
+      reader.onload = function(event) {
+        const tempImg = new Image();
+        tempImg.onload = async function() {
+          // 2. 性能保护：缩放过大的图片
+          // 如果图片超过 1080px，进行等比缩小以防前端 AI 推理导致浏览器内存溢出崩溃
+          const MAX_DIMENSION = 1080;
+          let scale = 1;
+          if (tempImg.width > MAX_DIMENSION || tempImg.height > MAX_DIMENSION) {
+            scale = Math.min(MAX_DIMENSION / tempImg.width, MAX_DIMENSION / tempImg.height);
+          }
+          
+          const resizedCanvas = document.createElement('canvas');
+          resizedCanvas.width = tempImg.width * scale;
+          resizedCanvas.height = tempImg.height * scale;
+          const ctx = resizedCanvas.getContext('2d');
+          
+          // 为了避免透明 PNG 原图底色变黑，先铺一层全透明
+          ctx.clearRect(0, 0, resizedCanvas.width, resizedCanvas.height);
+          ctx.drawImage(tempImg, 0, 0, resizedCanvas.width, resizedCanvas.height);
+          
+          const resizedImg = new Image();
+          resizedImg.onload = async function() {
+            // 3. 送入 AI 进行背景剥离
+            const resultDataUrl = await processImageRemoval(resizedImg);
+            // 4. 将结果生成物理冰箱贴 DOM
+            spawnMagnet(resultDataUrl);
+          };
+          // 注意：送给 AI 前的底图尽量用较高质量的 jpeg 或 png
+          resizedImg.src = resizedCanvas.toDataURL('image/png');
+        };
+        tempImg.src = event.target.result;
+      }
+      reader.readAsDataURL(file);
+    }
+
+    // 绑定 Input 上传事件
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files && e.target.files.length > 0) {
+        handleFile(e.target.files[0]);
+        // 清空 value 确保同一张图重复上传能触发 change 事件
+        e.target.value = '';
+      }
+    });
+
+    // 绑定拖拽上传事件
+    window.addEventListener('dragover', (e) => e.preventDefault());
+    window.addEventListener('drop', (e) => {
+      e.preventDefault();
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        handleFile(e.dataTransfer.files[0]);
+      }
+    });
+
+    /**
+     * 在页面上实例化一个冰箱贴 DOM 元素
+     */
+    function spawnMagnet(imgSrc) {
+        const img = document.createElement('img');
+        img.src = imgSrc;
+        img.className = 'magnet';
+        
+        // 随机放置在屏幕中央偏下的位置
+        const randomX = window.innerWidth / 2 - 110 + (Math.random() * 200 - 100);
+        const randomY = window.innerHeight / 2 - 50 + (Math.random() * 200 - 100);
+        
+        // 赋予一个随机的基础倾斜角度（-15度 到 15度），增加慵懒的自然感
+        const randomRotation = Math.random() * 30 - 15;
+        
+        img.style.left = randomX + 'px';
+        img.style.top = randomY + 'px';
+        img.style.setProperty('--base-rotation', `${randomRotation}deg`);
+        img.style.transform = `rotate(${randomRotation}deg)`;
+        
+        fridgeDoor.appendChild(img);
+        
+        // 绑定物理拖拽效果
+        makeDraggable(img);
+    }
+
+    /**
+     * 赋予 DOM 元素物理拖拽能力（兼容鼠标和移动端触摸）
+     */
+    function makeDraggable(el) {
+      let isDragging = false;
+      let startX, startY, initialX, initialY;
+
+      const startDrag = (e) => {
+        isDragging = true;
+        el.classList.add('dragging');
+        el.style.zIndex = magnetZIndex++; // 每次抓起都置顶
+        
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        
+        startX = clientX; 
+        startY = clientY;
+        initialX = el.offsetLeft; 
+        initialY = el.offsetTop;
+      };
+
+      const doDrag = (e) => {
+        if (!isDragging) return;
+        e.preventDefault(); // 防止移动端拖拽图片时屏幕滚动
+        
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        
+        // 计算偏移量并应用
+        const dx = clientX - startX;
+        const dy = clientY - startY;
+        el.style.left = `${initialX + dx}px`;
+        el.style.top = `${initialY + dy}px`;
+      };
+
+      const stopDrag = () => {
+        if(isDragging) {
+          isDragging = false;
+          el.classList.remove('dragging');
+          // 恢复其初始的随机倾斜角度
+          el.style.transform = `rotate(${el.style.getPropertyValue('--base-rotation')})`;
+        }
+      };
+
+      // 绑定事件
+      el.addEventListener('mousedown', startDrag);
+      el.addEventListener('touchstart', startDrag, {passive: false});
+      
+      window.addEventListener('mousemove', doDrag);
+      window.addEventListener('touchmove', doDrag, {passive: false});
+      
+      window.addEventListener('mouseup', stopDrag);
+      window.addEventListener('touchend', stopDrag);
+      
+      // 处理鼠标移出浏览器窗口的情况
+      window.addEventListener('mouseleave', stopDrag);
+    }
+  </script>
+</body>
+</html>
